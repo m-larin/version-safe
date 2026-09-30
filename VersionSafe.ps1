@@ -81,8 +81,21 @@
     Восстанавливать найденные разорванные ссылки: если содержимое файлов
     совпадает (SHA-256), копия заменяется жёсткой ссылкой. Включает -VerifyLinks.
 
+.PARAMETER Exclude
+    Шаблоны файлов и папок, которые не попадают в снимок. Подстановочные
+    символы * ? [ ], регистр не важен. Исключённая папка пропускается целиком.
+      • Шаблон без «\» сравнивается с именем на любой глубине: .vs, *.tmp
+      • Шаблон с «\» сравнивается с путём от корня источника:
+        MyProject\esp, *\build — папка build на любой глубине, кроме корня.
+    По умолчанию заполнен кэшами IDE и служебными файлами (.vs, node_modules,
+    __pycache__, ~$* и т.п.; полный список — в README). Указанное значение
+    заменяет список по умолчанию; -Exclude @() отключает исключения.
+
 .EXAMPLE
     .\VersionSafe.ps1 -SourcePath C:\Data -DestinationPath D:\Backups
+
+.EXAMPLE
+    .\VersionSafe.ps1 D:\MyDocuments E:\Backups -Exclude '.vs', 'node_modules', 'MyProject\esp', '*.iso'
 
 .EXAMPLE
     .\VersionSafe.ps1 C:\Data D:\Backups -DailyCount 14 -WeeklyCount 0 -MonthlyCount 6 -YearlyCount 0
@@ -140,7 +153,26 @@ Param(
     [ValidateRange(0, [int]::MaxValue)]
     [int]$VerifyLinksOlderThanDays = 0,
 
-    [Switch]$RepairBrokenLinks = $false
+    [Switch]$RepairBrokenLinks = $false,
+
+    # Только то, что гарантированно восстанавливается автоматически. Папки вроде
+    # bin, obj, build, target сюда не входят: у кого-то это могут быть данные.
+    [AllowEmptyCollection()]
+    [String[]]$Exclude = @(
+        # Кэши IDE и инструментов разработки
+        '.vs',                  # Visual Studio: индексы, IntelliSense (файлы заняты, пока открыт проект)
+        'node_modules',         # пакеты npm/yarn — восстанавливаются npm install
+        '__pycache__',          # байт-код Python
+        '.pytest_cache', '.mypy_cache', '.ruff_cache', '.tox',
+        '.venv',                # виртуальное окружение Python
+        '.gradle',              # кэш Gradle
+        '.cache',               # общий кэш инструментов
+        # Системные папки (важно, если источник — корень диска)
+        '$RECYCLE.BIN', 'System Volume Information',
+        # Временные и служебные файлы
+        '~$*',                  # файлы-блокировки Office, заняты открытым документом
+        'Thumbs.db', 'ehthumbs.db', '.DS_Store'
+    )
 )
 
 begin {
@@ -305,6 +337,7 @@ namespace VersionSafe
             [Parameter(Mandatory)][string]$SourceRoot,
             [Parameter(Mandatory)][string]$WorkPath,
             [string]$PreviousPath,
+            [string[]]$Exclude = @(),
             [Switch]$DryRun
         )
 
@@ -314,7 +347,18 @@ namespace VersionSafe
             BytesCopied = [long]0
             BytesTotal  = [long]0
             Skipped     = 0
+            Excluded    = 0
             Errors      = 0
+        }
+
+        # Шаблоны без «\» проверяются по имени, с «\» — по пути от корня источника.
+        $namePatterns = New-Object System.Collections.Generic.List[System.Management.Automation.WildcardPattern]
+        $pathPatterns = New-Object System.Collections.Generic.List[System.Management.Automation.WildcardPattern]
+        foreach ($p in $Exclude) {
+            if ([string]::IsNullOrWhiteSpace($p)) { continue }
+            $p = $p.Trim().Trim('\', '/').Replace('/', '\')
+            $wp = New-Object System.Management.Automation.WildcardPattern($p, [System.Management.Automation.WildcardOptions]::IgnoreCase)
+            if ($p.Contains('\')) { $pathPatterns.Add($wp) } else { $namePatterns.Add($wp) }
         }
 
         # Обход без рекурсии, чтобы не упереться в глубину стека на больших деревьях.
@@ -337,6 +381,17 @@ namespace VersionSafe
             foreach ($child in $children) {
                 $rel  = if ($relDir) { [System.IO.Path]::Combine($relDir, $child.Name) } else { $child.Name }
                 $dest = [System.IO.Path]::Combine($WorkPath, $rel)
+
+                $excluded = $false
+                foreach ($wp in $namePatterns) { if ($wp.IsMatch($child.Name)) { $excluded = $true; break } }
+                if (-not $excluded) {
+                    foreach ($wp in $pathPatterns) { if ($wp.IsMatch($rel)) { $excluded = $true; break } }
+                }
+                if ($excluded) {
+                    $stats.Excluded++
+                    Write-Verbose "Исключено: $rel"
+                    continue
+                }
 
                 # Символические ссылки и точки соединения не копируем и не обходим.
                 # Облачные заглушки (OneDrive) тоже точки повторной обработки, но LinkType у них пустой.
@@ -409,6 +464,9 @@ namespace VersionSafe
             $Stats.FilesCopied, ($Stats.BytesCopied / 1MB), $Stats.FilesLinked, ($Stats.BytesTotal / 1MB), $savings)
         if ($Stats.Skipped -gt 0) {
             Write-Information "Пропущено символических ссылок и точек соединения: $($Stats.Skipped)."
+        }
+        if ($Stats.Excluded -gt 0) {
+            Write-Information "Исключено по -Exclude: $($Stats.Excluded) (исключённая папка считается одним объектом)."
         }
         if ($Stats.Errors -gt 0) {
             Write-Information "Ошибок: $($Stats.Errors)."
@@ -778,6 +836,8 @@ end {
         }
         Write-Information "  Логи (дней)     = $LogRetentionDays"
         Write-Information "  Проверка ссылок = $VerifyLinks (старше $VerifyLinksOlderThanDays дней, восстановление: $RepairBrokenLinks)"
+        $excludeList = @($Exclude | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        Write-Information "  Исключения      = $(if ($excludeList.Count) { $excludeList -join ', ' } else { 'нет' })"
         Write-Information "=========================================="
 
         # Убираем незавершённые снимки прерванных запусков. Параллельный запуск
@@ -828,7 +888,7 @@ end {
 
         try {
             $stats = Invoke-SnapshotCopy -SourceRoot $resolvedSource -WorkPath $workPath `
-                -PreviousPath $previousPath -DryRun:$isDryRun
+                -PreviousPath $previousPath -Exclude $Exclude -DryRun:$isDryRun
 
             if (-not $isDryRun) {
                 [System.IO.Directory]::Move($workPath, $snapPath)
